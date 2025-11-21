@@ -147,6 +147,7 @@ __Don't forget to enable ReActor and set any source (to prevent "no source" erro
 7. Check the last message in your SD.Next Console:
 * If you see the message "--- PLEASE, RESTART the Server! ---" - stop the Server (CTRL+C or CMD+C) or just close your console
 8. Go to the `automatic\extensions\sd-webui-reactor-sfw` directory - if you see there `models\insightface` folder with the file `inswapper_128.onnx`, just move the file to the `automatic\models\insightface` folder
+   - Additional face-swap ONNX models placed in `models\insightface` will appear in the dropdown; models with square 128×128 or 256×256 inputs (e.g., Hyperswap 256) are supported.
 9. Run your SD.Next WebUI and enjoy!
 
 <a name="colab">If you use [Cagliostro Colab UI](https://github.com/Linaqruf/sd-notebook-collection):
