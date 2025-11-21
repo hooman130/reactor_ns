@@ -22,17 +22,25 @@ def patched_get_model(self, **kwargs):
     inputs = session.get_inputs()
     input_cfg = inputs[0]
     input_shape = input_cfg.shape
+    input_height = input_shape[2] if len(input_shape) > 2 else None
+    input_width = input_shape[3] if len(input_shape) > 3 else None
     outputs = session.get_outputs()
 
     if len(outputs) >= 5:
         return RetinaFace(model_file=self.onnx_file, session=session)
-    elif input_shape[2] == 192 and input_shape[3] == 192:
+    elif input_height == 192 and input_width == 192:
         return Landmark(model_file=self.onnx_file, session=session)
-    elif input_shape[2] == 96 and input_shape[3] == 96:
+    elif input_height == 96 and input_width == 96:
         return Attribute(model_file=self.onnx_file, session=session)
-    elif len(inputs) == 2 and input_shape[2] == input_shape[3] and input_shape[2] in [128, 256]:
-        return INSwapper(model_file=self.onnx_file, session=session)
-    elif input_shape[2] == input_shape[3] and input_shape[2] >= 112 and input_shape[2] % 16 == 0:
+    elif len(inputs) == 2:
+        # Some swapped-face models (e.g., Hyperswap 256) do not expose spatial dims in
+        # the ONNX session input metadata, so gracefully fall back to INSwapper if we
+        # cannot infer a more specific type.
+        if input_height is not None and input_height == input_width and input_height in [128, 256]:
+            return INSwapper(model_file=self.onnx_file, session=session)
+        if input_height is None or input_width is None:
+            return INSwapper(model_file=self.onnx_file, session=session)
+    elif input_height is not None and input_height == input_width and input_height >= 112 and input_height % 16 == 0:
         return ArcFaceONNX(model_file=self.onnx_file, session=session)
     else:
         return None
