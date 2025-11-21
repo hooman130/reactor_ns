@@ -32,8 +32,14 @@ def patched_get_model(self, **kwargs):
         return Landmark(model_file=self.onnx_file, session=session)
     elif input_height == 96 and input_width == 96:
         return Attribute(model_file=self.onnx_file, session=session)
-    elif len(inputs) == 2 and input_height is not None and input_height == input_width and input_height in [128, 256]:
-        return INSwapper(model_file=self.onnx_file, session=session)
+    elif len(inputs) == 2:
+        # Some swapped-face models (e.g., Hyperswap 256) do not expose spatial dims in
+        # the ONNX session input metadata, so gracefully fall back to INSwapper if we
+        # cannot infer a more specific type.
+        if input_height is not None and input_height == input_width and input_height in [128, 256]:
+            return INSwapper(model_file=self.onnx_file, session=session)
+        if input_height is None or input_width is None:
+            return INSwapper(model_file=self.onnx_file, session=session)
     elif input_height is not None and input_height == input_width and input_height >= 112 and input_height % 16 == 0:
         return ArcFaceONNX(model_file=self.onnx_file, session=session)
     else:
