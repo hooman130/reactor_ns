@@ -94,11 +94,21 @@ def patched_inswapper_init(self, model_file=None, session=None):
     for inp in inputs:
         self.input_names.append(inp.name)
     outputs = self.session.get_outputs()
-    output_names = []
-    for out in outputs:
-        output_names.append(out.name)
+    output_names = [out.name for out in outputs]
+    if not output_names:
+        graph_output_names = [out.name for out in graph.output]
+        raise ValueError(
+            f"No output nodes found in ONNX model {self.model_file}. Session outputs: {output_names}, "
+            f"graph outputs: {graph_output_names}"
+        )
+    if len(output_names) > 1:
+        logger.warning(
+            "Expected a single ONNX output for INSwapper, but found %s. Using the first output '%s'.",
+            len(output_names),
+            output_names[0],
+        )
+        output_names = [output_names[0]]
     self.output_names = output_names
-    assert len(self.output_names) == 1
     input_cfg = inputs[0]
     input_shape = input_cfg.shape
     self.input_shape = input_shape
