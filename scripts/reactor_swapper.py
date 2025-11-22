@@ -307,6 +307,27 @@ def analyze_faces(img_data: np.ndarray, det_size=(640, 640), det_thresh=0.5, det
     face_analyser.prepare(ctx_id=0, det_thresh=det_thresh, det_size=det_size)
     return face_analyser.get(img_data, max_num=det_maxnum)
 
+
+def has_minimum_landmarks(face, role: str):
+    if face is None:
+        logger.status("No %s face available to swap", role)
+        return False
+
+    kps = getattr(face, "kps", None)
+    if kps is None:
+        logger.error("%s face is missing keypoints (kps)", role.capitalize())
+        return False
+
+    if len(kps) < 5 or np.asarray(kps).shape[-1] < 2:
+        logger.error(
+            "%s face keypoints are incomplete: expected at least 5x2 entries, got shape %s",
+            role.capitalize(),
+            np.asarray(kps).shape,
+        )
+        return False
+
+    return True
+
 def get_face_single(img_data: np.ndarray, face, face_index=0, det_size=(640, 640), gender_source=0, gender_target=0, det_thresh=0.5, det_maxnum=0):
 
     buffalo_path = os.path.join(models_path, "insightface/models/buffalo_l.zip")
@@ -793,11 +814,25 @@ def operate(
 
             output_info = f"TargetFaceIndex={face_num};Age={target_age};Gender={target_gender}\n"
             output.append(output_info)
-            
+
             if target_face is not None and wrong_gender == 0:
                 logger.status("Swapping Source into Target")
+                if not has_minimum_landmarks(source_face, "source"):
+                    logger.status(
+                        "Skipping swap for target face %s because source landmarks are incomplete",
+                        face_num,
+                    )
+                    continue
+
+                if not has_minimum_landmarks(target_face, "target"):
+                    logger.status(
+                        "Skipping swap for target face %s because target landmarks are incomplete",
+                        face_num,
+                    )
+                    continue
+
                 swapped_image = face_swapper.get(result, target_face, source_face)
-                                        
+
                 if mask_face:
                     result = apply_face_mask(swapped_image=swapped_image,target_image=result,target_face=target_face,entire_mask_image=entire_mask_image)
                 else:
