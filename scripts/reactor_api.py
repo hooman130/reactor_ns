@@ -77,6 +77,9 @@ def get_models():
     models_path = os.path.join(scripts.basedir(), "models/insightface/*")
     models = glob.glob(models_path)
     models = [x for x in models if x.endswith(".onnx") or x.endswith(".pth")]
+    models = sorted(models, key=str.lower)
+    if any(os.path.split(m)[1] == "inswapper_128.onnx" for m in models):
+        models = [m for m in models if os.path.split(m)[1] == "inswapper_128.onnx"] + [m for m in models if os.path.split(m)[1] != "inswapper_128.onnx"]
     return models
 
 def get_full_model(model_name):

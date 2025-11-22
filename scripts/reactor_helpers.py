@@ -181,12 +181,14 @@ def get_models():
     models = glob.glob(models_path_init)
     models = [x for x in models if x.endswith(".onnx") or x.endswith(".pth")]
     models_names = []
-    for model in models:
+    for model in sorted(models, key=str.lower):
         model_path = os.path.split(model)
         if MODELS_PATH is None:
             MODELS_PATH = model_path[0]
         model_name = model_path[1]
         models_names.append(model_name)
+    if "inswapper_128.onnx" in models_names:
+        models_names = ["inswapper_128.onnx"] + [m for m in models_names if m != "inswapper_128.onnx"]
     return models_names
 
 def load_face_model(filename: str):

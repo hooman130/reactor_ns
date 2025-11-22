@@ -21,9 +21,10 @@ req_file = os.path.join(BASE_PATH, "requirements.txt")
 
 models_dir = os.path.join(models_path, "insightface")
 
-model_url = "https://huggingface.co/datasets/Gourieff/ReActor/resolve/main/models/inswapper_128.onnx"
-model_name = os.path.basename(model_url)
-model_path = os.path.join(models_dir, model_name)
+model_urls = [
+    "https://huggingface.co/datasets/Gourieff/ReActor/resolve/main/models/inswapper_128.onnx",
+    "https://huggingface.co/facefusion/models-3.3.0/resolve/main/hyperswap_1a_256.onnx",
+]
 
 def pip_install(*args):
     subprocess.run([sys.executable, "-m", "pip", "install", *args])
@@ -58,8 +59,11 @@ def download(url, path):
 if not os.path.exists(models_dir):
     os.makedirs(models_dir)
 
-if not os.path.exists(model_path):
-    download(model_url, model_path)
+for model_url in model_urls:
+    model_name = os.path.basename(model_url)
+    model_path = os.path.join(models_dir, model_name)
+    if not os.path.exists(model_path):
+        download(model_url, model_path)
 
 # print("ReActor preheating...", end=' ')
 

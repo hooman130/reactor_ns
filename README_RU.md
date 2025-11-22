@@ -144,6 +144,7 @@
 7. Проверьте последнее сообщение в консоли SD.Next:
 * Если вы видите "--- PLEASE, RESTART the Server! ---" - остановите Сервер (CTRL+C или CMD+C) или просто закройте консоль
 8. Перейдите в директорию `automatic\extensions\sd-webui-reactor-sfw` - если вы видите там папку `models\insightface` с файлом `inswapper_128.onnx` внутри, переместите его в папку `automatic\models\insightface`
+   - Установщик скачивает в `models\insightface` обе модели: `inswapper_128.onnx` и `hyperswap_1a_256.onnx`; помещённые туда дополнительные ONNX-модели face swap появятся в выпадающем списке. Поддерживаются квадратные 128×128 или 256×256 (например, Hyperswap 256).
 9. Готово, можете запустить SD.Next WebUI!
 
 <a name="colab">Если вы используете [Cagliostro Colab UI](https://github.com/Linaqruf/sd-notebook-collection):

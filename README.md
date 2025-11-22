@@ -147,6 +147,7 @@ __Don't forget to enable ReActor and set any source (to prevent "no source" erro
 7. Check the last message in your SD.Next Console:
 * If you see the message "--- PLEASE, RESTART the Server! ---" - stop the Server (CTRL+C or CMD+C) or just close your console
 8. Go to the `automatic\extensions\sd-webui-reactor-sfw` directory - if you see there `models\insightface` folder with the file `inswapper_128.onnx`, just move the file to the `automatic\models\insightface` folder
+   - The installer downloads both `inswapper_128.onnx` and `hyperswap_1a_256.onnx` into `models\insightface`; additional face-swap ONNX models placed there will appear in the dropdown, and models with square 128×128 or 256×256 inputs (e.g., Hyperswap 256) are supported.
 9. Run your SD.Next WebUI and enjoy!
 
 <a name="colab">If you use [Cagliostro Colab UI](https://github.com/Linaqruf/sd-notebook-collection):
@@ -167,6 +168,18 @@ __Don't forget to enable ReActor and set any source (to prevent "no source" erro
 - Saving ans loading **Safetensors Face Models**
 - **Facial Mask Correction** to avoid any  pixelation around face contours
 - Ability to set the **Postprocessing order**
+
+## Model choices and performance notes
+
+The extension auto-discovers ONNX/PTH face-swap models placed in `models/insightface` and recognizes square 128×128 or 256×256 two-input swapper networks (e.g., `inswapper_128.onnx` and `hyperswap_1a_256.onnx`). The packaged installer fetches both of those swapper files so they appear in the Settings dropdown and external API responses, but the project does not include quality benchmarks—pick the model that best fits your hardware and run-side experiments.
+
+For throughput and quality tuning, consider:
+
+- **Execution providers:** the InsightFace patch prefers TensorRT, then CUDA, then CPU where available, so enabling GPU/accelerator backends improves inference speed.
+- **Detection settings:** the API exposes `det_thresh` and `det_maxnum` to trade off detection strictness versus recall and to cap faces processed per image if you need faster runs.
+- **Postprocessing knobs:** upscaling, face restoration, and mask correction are toggled per request through the API/UI to balance fidelity and runtime.
+
+If you want to try alternative swappers, place additional ONNX/PTH models that follow the same two-input 128×128 or 256×256 convention into `models/insightface`; they will be listed automatically in the UI/API for selection.
 - **100% compatibility** with different **SD WebUIs**: Automatic1111, SD.Next, Cagliostro Colab UI
 - **Fast performance** even with CPU, ReActor for SD WebUI is absolutely not picky about how powerful your GPU is
 - **CUDA** acceleration support since version 0.5.0
