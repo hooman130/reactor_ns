@@ -1,6 +1,7 @@
 import os.path as osp
 import glob
 import logging
+import numpy as np
 import insightface
 from insightface.model_zoo.model_zoo import ModelRouter, PickableInferenceSession, get_default_providers
 from insightface.model_zoo.retinaface import RetinaFace
@@ -83,16 +84,104 @@ def patched_faceanalysis_prepare(self, ctx_id, det_thresh=0.5, det_size=(640, 64
             model.prepare(ctx_id)
 
 
+def _latent_dim_from_initializers(graph):
+    # Prefer square or near-square projection matrices over 1D bias vectors.
+    for initializer in graph.initializer:
+        dims = tuple(initializer.dims)
+        if len(dims) == 2:
+            if dims[0] == dims[1] and dims[0] in (64, 128, 256, 512):
+                return dims[0]
+            if dims[1] in (64, 128, 256, 512):
+                return dims[1]
+    return None
+
+
+def _pick_emap(graph, latent_dim):
+    """
+    Hyperswap models may not store the embedding map as the last initializer
+    or may expose a 1D bias vector there, which breaks the stock dot product
+    against arcface embeddings. Choose a matrix whose shape aligns with the
+    latent size (guessing common dimensions when metadata is missing),
+    transposing if needed, and fall back to an identity map so inference can
+    proceed even when the ONNX layout differs.
+    """
+
+    best = None
+    if latent_dim is None:
+        latent_dim = _latent_dim_from_initializers(graph) or 512
+
+    for initializer in graph.initializer:
+        arr = numpy_helper.to_array(initializer)
+        if arr.ndim == 2:
+            if arr.shape[0] == latent_dim:
+                best = arr
+                break
+            if arr.shape[1] == latent_dim:
+                best = arr.T
+                break
+
+    if best is None and latent_dim is not None:
+        logger.warning(
+            "No embedding map matched latent dim %s; using identity matrix so inference can continue.",
+            latent_dim,
+        )
+        best = np.eye(latent_dim, dtype=np.float32)
+
+    if best is None:
+        logger.warning(
+            "No embedding map found in ONNX graph; defaulting to %sx%s identity passthrough.",
+            latent_dim,
+            latent_dim,
+        )
+        best = np.eye(latent_dim, dtype=np.float32)
+
+    if best.ndim == 1:
+        best = np.diag(best.astype(np.float32))
+
+    return np.asarray(best, dtype=np.float32)
+
+
+def _infer_latent_dim(inputs, graph):
+    latent_dim = None
+    if len(inputs) > 1:
+        latent_shape = inputs[1].shape
+        if len(latent_shape) > 1 and latent_shape[1] is not None:
+            latent_dim = latent_shape[1]
+    if latent_dim is None and len(graph.input) > 1:
+        latent_vi = graph.input[1]
+        if latent_vi.type.HasField("tensor_type"):
+            dims = []
+            for dim in latent_vi.type.tensor_type.shape.dim:
+                if dim.HasField("dim_value"):
+                    dims.append(dim.dim_value)
+                elif dim.HasField("dim_param"):
+                    try:
+                        dims.append(int(dim.dim_param))
+                    except (TypeError, ValueError):
+                        dims.append(None)
+                else:
+                    dims.append(None)
+            if len(dims) > 1 and dims[1] is not None:
+                latent_dim = dims[1]
+    return latent_dim
+
+
 def patched_inswapper_init(self, model_file=None, session=None):
     self.model_file = model_file
     self.session = session
     model = onnx.load(self.model_file)
     graph = model.graph
-    self.emap = numpy_helper.to_array(graph.initializer[-1])
+    inputs = self.session.get_inputs() if self.session is not None else None
+    latent_dim = _infer_latent_dim(inputs, graph) if inputs is not None else None
+    self.emap = _pick_emap(graph, latent_dim)
     self.input_mean = 0.0
     self.input_std = 255.0
     if self.session is None:
         self.session = onnxruntime.InferenceSession(self.model_file, None)
+        inputs = self.session.get_inputs()
+        if latent_dim is None:
+            latent_dim = _infer_latent_dim(inputs, graph)
+            self.emap = _pick_emap(graph, latent_dim)
     inputs = self.session.get_inputs()
     self.input_names = []
     for inp in inputs:
