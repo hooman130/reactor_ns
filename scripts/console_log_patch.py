@@ -26,6 +26,10 @@ def patched_get_model(self, **kwargs):
     input_width = input_shape[3] if len(input_shape) > 3 else None
     outputs = session.get_outputs()
 
+    # The stock router indexes spatial dims directly (input_shape[2]/[3]) which fails
+    # for models like hyperswap_256 that publish only batch/channel dims. We guard
+    # every access and fall back to INSwapper when the shape is incomplete so the
+    # model still loads without editing insightface itself.
     if len(outputs) >= 5:
         return RetinaFace(model_file=self.onnx_file, session=session)
     elif input_height == 192 and input_width == 192:
@@ -112,7 +116,45 @@ def patched_inswapper_init(self, model_file=None, session=None):
     input_cfg = inputs[0]
     input_shape = input_cfg.shape
     self.input_shape = input_shape
-    self.input_size = tuple(input_shape[2:4][::-1])
+    if len(input_shape) >= 4 and input_shape[2] is not None and input_shape[3] is not None:
+        self.input_size = tuple(input_shape[2:4][::-1])
+    else:
+        inferred_size = None
+        # Attempt to infer static dimensions from the ONNX graph definition first.
+        for value_info in graph.input:
+            if value_info.name == input_cfg.name and value_info.type.HasField("tensor_type"):
+                tensor_shape = value_info.type.tensor_type.shape
+                dims = []
+                for dim in tensor_shape.dim:
+                    if dim.HasField("dim_value"):
+                        dims.append(dim.dim_value)
+                    elif dim.HasField("dim_param"):
+                        try:
+                            dims.append(int(dim.dim_param))
+                        except (TypeError, ValueError):
+                            dims.append(None)
+                    else:
+                        dims.append(None)
+
+                if len(dims) >= 4 and dims[2] and dims[3]:
+                    inferred_size = (dims[3], dims[2])
+                    break
+
+        # Fall back to a sensible default if the model omits spatial dims (e.g., Hyperswap 256).
+        if inferred_size is None:
+            model_name = osp.basename(self.model_file).lower() if self.model_file else ""
+            if "256" in model_name:
+                inferred_size = (256, 256)
+            else:
+                inferred_size = (128, 128)
+            logger.warning(
+                "Model %s does not expose spatial input dims; defaulting INSwapper input size to %sx%s.",
+                model_name or "unknown",
+                inferred_size[0],
+                inferred_size[1],
+            )
+
+        self.input_size = inferred_size
 
 
 def patched_get_default_providers():
@@ -132,12 +174,14 @@ patched_functions = [patched_get_default_providers, patched_get_model, patched_f
 
 
 def apply_logging_patch(console_logging_level):
+    # Always apply the patched insightface hooks so model routing and INSwapper
+    # initialization remain resilient (required for models like hyperswap_256),
+    # while only the logger verbosity changes per level.
+    patch_insightface(*patched_functions)
+
     if console_logging_level == 0:
-        patch_insightface(*patched_functions)
         logger.setLevel(logging.WARNING)
     elif console_logging_level == 1:
-        patch_insightface(*patched_functions)
         logger.setLevel(logging.STATUS)
     elif console_logging_level == 2:
-        patch_insightface(*original_functions)
         logger.setLevel(logging.INFO)
