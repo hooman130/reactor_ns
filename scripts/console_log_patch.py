@@ -35,11 +35,11 @@ def patched_get_model(self, **kwargs):
     elif len(inputs) == 2:
         # Some swapped-face models (e.g., Hyperswap 256) do not expose spatial dims in
         # the ONNX session input metadata, so gracefully fall back to INSwapper if we
-        # cannot infer a more specific type.
+        # cannot infer a more specific type. Default to INSwapper for all two-input
+        # models to avoid returning None for unknown variants.
         if input_height is not None and input_height == input_width and input_height in [128, 256]:
             return INSwapper(model_file=self.onnx_file, session=session)
-        if input_height is None or input_width is None:
-            return INSwapper(model_file=self.onnx_file, session=session)
+        return INSwapper(model_file=self.onnx_file, session=session)
     elif input_height is not None and input_height == input_width and input_height >= 112 and input_height % 16 == 0:
         return ArcFaceONNX(model_file=self.onnx_file, session=session)
     else:
