@@ -26,6 +26,10 @@ def patched_get_model(self, **kwargs):
     input_width = input_shape[3] if len(input_shape) > 3 else None
     outputs = session.get_outputs()
 
+    # The stock router indexes spatial dims directly (input_shape[2]/[3]) which fails
+    # for models like hyperswap_256 that publish only batch/channel dims. We guard
+    # every access and fall back to INSwapper when the shape is incomplete so the
+    # model still loads without editing insightface itself.
     if len(outputs) >= 5:
         return RetinaFace(model_file=self.onnx_file, session=session)
     elif input_height == 192 and input_width == 192:
@@ -170,12 +174,14 @@ patched_functions = [patched_get_default_providers, patched_get_model, patched_f
 
 
 def apply_logging_patch(console_logging_level):
+    # Always apply the patched insightface hooks so model routing and INSwapper
+    # initialization remain resilient (required for models like hyperswap_256),
+    # while only the logger verbosity changes per level.
+    patch_insightface(*patched_functions)
+
     if console_logging_level == 0:
-        patch_insightface(*patched_functions)
         logger.setLevel(logging.WARNING)
     elif console_logging_level == 1:
-        patch_insightface(*patched_functions)
         logger.setLevel(logging.STATUS)
     elif console_logging_level == 2:
-        patch_insightface(*original_functions)
         logger.setLevel(logging.INFO)
