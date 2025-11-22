@@ -338,6 +338,12 @@ Just delete the folder `sd-webui-reactor-sfw` inside the `extensions` directory 
 
 If you encounter any issues with installing this extension in the StabilityMatrix package manager - read here how to solve: https://github.com/Gourieff/sd-webui-reactor/issues/129#issuecomment-1768210875
 
+### **XI. "IndexError: list index out of range" when loading hyperswap_256**
+
+- **What happens:** the stock InsightFace router indexes the ONNX input shape assuming spatial dimensions exist (`input_shape[2]`/`[3]`). Hyperswap 256 publishes only batch and channel dimensions, so the router raises `IndexError` before ReActor can hand the model to INSwapper.
+- **How it was fixed:** ReActor wraps InsightFace at runtime (see `scripts/console_log_patch.py`) to guard shape reads and default two-input models to INSwapper while inferring the missing spatial size. No vendor files under `site-packages/insightface` are modified; the patch is applied when ReActor starts.
+- **Why keep the packaged InsightFace build:** the extension targets the official `insightface==0.7.3` wheel because its INSwapper class and graph format match the rest of the pipeline (detectors, ArcFace, gender/age models). Hyperswap follows the same INSwapper interface, so with the runtime patch it works without needing a separate library or custom fork.
+
 ## Updating
 
 A good and quick way to check for Extensions updates: https://github.com/Gourieff/sd-webui-extensions-updater

@@ -1,6 +1,7 @@
 import os.path as osp
 import glob
 import logging
+import numpy as np
 import insightface
 from insightface.model_zoo.model_zoo import ModelRouter, PickableInferenceSession, get_default_providers
 from insightface.model_zoo.retinaface import RetinaFace
@@ -26,6 +27,10 @@ def patched_get_model(self, **kwargs):
     input_width = input_shape[3] if len(input_shape) > 3 else None
     outputs = session.get_outputs()
 
+    # The stock router indexes spatial dims directly (input_shape[2]/[3]) which fails
+    # for models like hyperswap_256 that publish only batch/channel dims. We guard
+    # every access and fall back to INSwapper when the shape is incomplete so the
+    # model still loads without editing insightface itself.
     if len(outputs) >= 5:
         return RetinaFace(model_file=self.onnx_file, session=session)
     elif input_height == 192 and input_width == 192:
@@ -79,16 +84,113 @@ def patched_faceanalysis_prepare(self, ctx_id, det_thresh=0.5, det_size=(640, 64
             model.prepare(ctx_id)
 
 
+def _latent_dim_from_initializers(graph):
+    # Prefer square or near-square projection matrices over 1D bias vectors.
+    for initializer in graph.initializer:
+        dims = tuple(initializer.dims)
+        if len(dims) == 2:
+            if dims[0] == dims[1] and dims[0] in (64, 128, 256, 512):
+                return dims[0]
+            if dims[1] in (64, 128, 256, 512):
+                return dims[1]
+    return None
+
+
+def _pick_emap(graph, latent_dim):
+    """
+    Hyperswap models may not store the embedding map as the last initializer
+    or may expose a 1D bias vector there, which breaks the stock dot product
+    against arcface embeddings. Choose a matrix whose shape aligns with the
+    latent size (guessing common dimensions when metadata is missing),
+    transposing if needed, and fall back to an identity map so inference can
+    proceed even when the ONNX layout differs.
+    """
+
+    best = None
+    if latent_dim is None:
+        latent_dim = _latent_dim_from_initializers(graph) or 512
+
+    allowed_dims = {64, 128, 256, 512, latent_dim}
+    for initializer in graph.initializer:
+        arr = numpy_helper.to_array(initializer)
+        if arr.ndim != 2:
+            continue
+
+        # Skip tiny matrices (e.g., convolution kernels like 3x3) that cannot be
+        # valid embedding maps and would trigger the shape mismatch seen with
+        # hyperswap_256 (512 x 3).
+        if arr.shape[0] not in allowed_dims and arr.shape[1] not in allowed_dims:
+            continue
+
+        if arr.shape[0] == latent_dim:
+            best = arr
+            break
+        if arr.shape[1] == latent_dim:
+            best = arr.T
+            break
+
+    if best is None and latent_dim is not None:
+        logger.warning(
+            "No embedding map matched latent dim %s; using identity matrix so inference can continue.",
+            latent_dim,
+        )
+        best = np.eye(latent_dim, dtype=np.float32)
+
+    if best is None:
+        logger.warning(
+            "No embedding map found in ONNX graph; defaulting to %sx%s identity passthrough.",
+            latent_dim,
+            latent_dim,
+        )
+        best = np.eye(latent_dim, dtype=np.float32)
+
+    if best.ndim == 1:
+        best = np.diag(best.astype(np.float32))
+
+    return np.asarray(best, dtype=np.float32)
+
+
+def _infer_latent_dim(inputs, graph):
+    latent_dim = None
+    if len(inputs) > 1:
+        latent_shape = inputs[1].shape
+        if len(latent_shape) > 1 and latent_shape[1] is not None:
+            latent_dim = latent_shape[1]
+    if latent_dim is None and len(graph.input) > 1:
+        latent_vi = graph.input[1]
+        if latent_vi.type.HasField("tensor_type"):
+            dims = []
+            for dim in latent_vi.type.tensor_type.shape.dim:
+                if dim.HasField("dim_value"):
+                    dims.append(dim.dim_value)
+                elif dim.HasField("dim_param"):
+                    try:
+                        dims.append(int(dim.dim_param))
+                    except (TypeError, ValueError):
+                        dims.append(None)
+                else:
+                    dims.append(None)
+            if len(dims) > 1 and dims[1] is not None:
+                latent_dim = dims[1]
+    return latent_dim
+
+
 def patched_inswapper_init(self, model_file=None, session=None):
     self.model_file = model_file
     self.session = session
     model = onnx.load(self.model_file)
     graph = model.graph
-    self.emap = numpy_helper.to_array(graph.initializer[-1])
+    inputs = self.session.get_inputs() if self.session is not None else None
+    latent_dim = _infer_latent_dim(inputs, graph) if inputs is not None else None
+    self.emap = _pick_emap(graph, latent_dim)
     self.input_mean = 0.0
     self.input_std = 255.0
     if self.session is None:
         self.session = onnxruntime.InferenceSession(self.model_file, None)
+        inputs = self.session.get_inputs()
+        if latent_dim is None:
+            latent_dim = _infer_latent_dim(inputs, graph)
+            self.emap = _pick_emap(graph, latent_dim)
     inputs = self.session.get_inputs()
     self.input_names = []
     for inp in inputs:
@@ -112,7 +214,45 @@ def patched_inswapper_init(self, model_file=None, session=None):
     input_cfg = inputs[0]
     input_shape = input_cfg.shape
     self.input_shape = input_shape
-    self.input_size = tuple(input_shape[2:4][::-1])
+    if len(input_shape) >= 4 and input_shape[2] is not None and input_shape[3] is not None:
+        self.input_size = tuple(input_shape[2:4][::-1])
+    else:
+        inferred_size = None
+        # Attempt to infer static dimensions from the ONNX graph definition first.
+        for value_info in graph.input:
+            if value_info.name == input_cfg.name and value_info.type.HasField("tensor_type"):
+                tensor_shape = value_info.type.tensor_type.shape
+                dims = []
+                for dim in tensor_shape.dim:
+                    if dim.HasField("dim_value"):
+                        dims.append(dim.dim_value)
+                    elif dim.HasField("dim_param"):
+                        try:
+                            dims.append(int(dim.dim_param))
+                        except (TypeError, ValueError):
+                            dims.append(None)
+                    else:
+                        dims.append(None)
+
+                if len(dims) >= 4 and dims[2] and dims[3]:
+                    inferred_size = (dims[3], dims[2])
+                    break
+
+        # Fall back to a sensible default if the model omits spatial dims (e.g., Hyperswap 256).
+        if inferred_size is None:
+            model_name = osp.basename(self.model_file).lower() if self.model_file else ""
+            if "256" in model_name:
+                inferred_size = (256, 256)
+            else:
+                inferred_size = (128, 128)
+            logger.warning(
+                "Model %s does not expose spatial input dims; defaulting INSwapper input size to %sx%s.",
+                model_name or "unknown",
+                inferred_size[0],
+                inferred_size[1],
+            )
+
+        self.input_size = inferred_size
 
 
 def patched_get_default_providers():
@@ -132,12 +272,14 @@ patched_functions = [patched_get_default_providers, patched_get_model, patched_f
 
 
 def apply_logging_patch(console_logging_level):
+    # Always apply the patched insightface hooks so model routing and INSwapper
+    # initialization remain resilient (required for models like hyperswap_256),
+    # while only the logger verbosity changes per level.
+    patch_insightface(*patched_functions)
+
     if console_logging_level == 0:
-        patch_insightface(*patched_functions)
         logger.setLevel(logging.WARNING)
     elif console_logging_level == 1:
-        patch_insightface(*patched_functions)
         logger.setLevel(logging.STATUS)
     elif console_logging_level == 2:
-        patch_insightface(*original_functions)
         logger.setLevel(logging.INFO)
