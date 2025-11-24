@@ -147,7 +147,6 @@ __Don't forget to enable ReActor and set any source (to prevent "no source" erro
 7. Check the last message in your SD.Next Console:
 * If you see the message "--- PLEASE, RESTART the Server! ---" - stop the Server (CTRL+C or CMD+C) or just close your console
 8. Go to the `automatic\extensions\sd-webui-reactor-sfw` directory - if you see there `models\insightface` folder with the file `inswapper_128.onnx`, just move the file to the `automatic\models\insightface` folder
-   - Additional face-swap ONNX models placed in `models\insightface` will appear in the dropdown; models with square 128×128 or 256×256 inputs (e.g., Hyperswap 256) are supported.
 9. Run your SD.Next WebUI and enjoy!
 
 <a name="colab">If you use [Cagliostro Colab UI](https://github.com/Linaqruf/sd-notebook-collection):
@@ -337,12 +336,6 @@ Just delete the folder `sd-webui-reactor-sfw` inside the `extensions` directory 
 ### **X. StabilityMatrix Issues**
 
 If you encounter any issues with installing this extension in the StabilityMatrix package manager - read here how to solve: https://github.com/Gourieff/sd-webui-reactor/issues/129#issuecomment-1768210875
-
-### **XI. "IndexError: list index out of range" when loading hyperswap_256**
-
-- **What happens:** the stock InsightFace router indexes the ONNX input shape assuming spatial dimensions exist (`input_shape[2]`/`[3]`). Hyperswap 256 publishes only batch and channel dimensions, so the router raises `IndexError` before ReActor can hand the model to INSwapper.
-- **How it was fixed:** ReActor wraps InsightFace at runtime (see `scripts/console_log_patch.py`) to guard shape reads and default two-input models to INSwapper while inferring the missing spatial size. No vendor files under `site-packages/insightface` are modified; the patch is applied when ReActor starts.
-- **Why keep the packaged InsightFace build:** the extension targets the official `insightface==0.7.3` wheel because its INSwapper class and graph format match the rest of the pipeline (detectors, ArcFace, gender/age models). Hyperswap follows the same INSwapper interface, so with the runtime patch it works without needing a separate library or custom fork.
 
 ## Updating
 

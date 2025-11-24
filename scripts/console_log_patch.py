@@ -1,8 +1,9 @@
 import os.path as osp
 import glob
 import logging
-import numpy as np
 import insightface
+import cv2
+import numpy as np
 from insightface.model_zoo.model_zoo import ModelRouter, PickableInferenceSession, get_default_providers
 from insightface.model_zoo.retinaface import RetinaFace
 from insightface.model_zoo.landmark import Landmark
@@ -10,7 +11,7 @@ from insightface.model_zoo.attribute import Attribute
 from insightface.model_zoo.inswapper import INSwapper
 from insightface.model_zoo.arcface_onnx import ArcFaceONNX
 from insightface.app import FaceAnalysis
-from insightface.utils import DEFAULT_MP_NAME, ensure_available
+from insightface.utils import DEFAULT_MP_NAME, ensure_available, face_align
 from insightface.model_zoo import model_zoo
 import onnxruntime
 import onnx
@@ -18,37 +19,53 @@ from onnx import numpy_helper
 from scripts.reactor_logger import logger
 
 
+def _get_input_shape_dims(input_info):
+    try:
+        return len(input_info.shape)
+    except Exception:
+        return 0
+
+
+def _find_blob_and_latent_inputs(inputs):
+    blob_input = None
+    latent_input = None
+    for inp in inputs:
+        dims = _get_input_shape_dims(inp)
+        if dims == 4:
+            blob_input = inp
+        elif dims == 2:
+            latent_input = inp
+    return blob_input, latent_input
+
+
 def patched_get_model(self, **kwargs):
     session = PickableInferenceSession(self.onnx_file, **kwargs)
     inputs = session.get_inputs()
     input_cfg = inputs[0]
     input_shape = input_cfg.shape
-    input_height = input_shape[2] if len(input_shape) > 2 else None
-    input_width = input_shape[3] if len(input_shape) > 3 else None
     outputs = session.get_outputs()
 
-    # The stock router indexes spatial dims directly (input_shape[2]/[3]) which fails
-    # for models like hyperswap_256 that publish only batch/channel dims. We guard
-    # every access and fall back to INSwapper when the shape is incomplete so the
-    # model still loads without editing insightface itself.
     if len(outputs) >= 5:
         return RetinaFace(model_file=self.onnx_file, session=session)
-    elif input_height == 192 and input_width == 192:
+
+    dims = _get_input_shape_dims(input_cfg)
+    if dims >= 4 and input_shape[2] == 192 and input_shape[3] == 192:
         return Landmark(model_file=self.onnx_file, session=session)
-    elif input_height == 96 and input_width == 96:
+    elif dims >= 4 and input_shape[2] == 96 and input_shape[3] == 96:
         return Attribute(model_file=self.onnx_file, session=session)
-    elif len(inputs) == 2:
-        # Some swapped-face models (e.g., Hyperswap 256) do not expose spatial dims in
-        # the ONNX session input metadata, so gracefully fall back to INSwapper if we
-        # cannot infer a more specific type. Default to INSwapper for all two-input
-        # models to avoid returning None for unknown variants.
-        if input_height is not None and input_height == input_width and input_height in [128, 256]:
-            return INSwapper(model_file=self.onnx_file, session=session)
-        return INSwapper(model_file=self.onnx_file, session=session)
-    elif input_height is not None and input_height == input_width and input_height >= 112 and input_height % 16 == 0:
+
+    if len(inputs) == 2:
+        blob_input, latent_input = _find_blob_and_latent_inputs(inputs)
+        if blob_input is not None and latent_input is not None:
+            blob_shape = blob_input.shape
+            if blob_shape[2] == 128 and blob_shape[3] == 128:
+                return INSwapper(model_file=self.onnx_file, session=session)
+            if blob_shape[2] == blob_shape[3] and blob_shape[2] >= 192:
+                return Hyperswapper(model_file=self.onnx_file, session=session)
+
+    if dims >= 4 and input_shape[2] == input_shape[3] and input_shape[2] >= 112 and input_shape[2] % 16 == 0:
         return ArcFaceONNX(model_file=self.onnx_file, session=session)
-    else:
-        return None
+    return None
 
 
 def patched_faceanalysis_init(self, name=DEFAULT_MP_NAME, root='~/.insightface', allowed_modules=None, **kwargs):
@@ -276,90 +293,106 @@ def patched_inswapper_init(self, model_file=None, session=None):
     self.session = session
     model = onnx.load(self.model_file)
     graph = model.graph
-    inputs = self.session.get_inputs() if self.session is not None else None
-    latent_dim = _infer_latent_dim(inputs, graph) if inputs is not None else None
-    self.emap = _pick_emap(graph, latent_dim)
+    self.emap = numpy_helper.to_array(graph.initializer[-1])
     self.input_mean = 0.0
     self.input_std = 255.0
     if self.session is None:
         self.session = onnxruntime.InferenceSession(self.model_file, None)
-        inputs = self.session.get_inputs()
-        if latent_dim is None:
-            latent_dim = _infer_latent_dim(inputs, graph)
-            self.emap = _pick_emap(graph, latent_dim)
     inputs = self.session.get_inputs()
-
-    # Some models (e.g., hyperswap_256) expose the latent input first and the
-    # target image second, which causes INSwapper.get to feed the tensors in the
-    # wrong order. Reorder the inputs so the 4D image tensor is always first and
-    # embeddings follow.
-    image_input = None
+    self.input_names = []
     for inp in inputs:
-        if len(inp.shape) >= 4:
-            image_input = inp
-            break
-    if image_input is None:
-        image_input = inputs[0]
-    reordered_inputs = [image_input] + [inp for inp in inputs if inp is not image_input]
-    self.input_names = [inp.name for inp in reordered_inputs]
+        self.input_names.append(inp.name)
     outputs = self.session.get_outputs()
-    output_names = [out.name for out in outputs]
-    if not output_names:
-        graph_output_names = [out.name for out in graph.output]
-        raise ValueError(
-            f"No output nodes found in ONNX model {self.model_file}. Session outputs: {output_names}, "
-            f"graph outputs: {graph_output_names}"
-        )
-    if len(output_names) > 1:
-        logger.warning(
-            "Expected a single ONNX output for INSwapper, but found %s. Using the first output '%s'.",
-            len(output_names),
-            output_names[0],
-        )
-        output_names = [output_names[0]]
+    output_names = []
+    for out in outputs:
+        output_names.append(out.name)
     self.output_names = output_names
-    input_cfg = reordered_inputs[0]
+    assert len(self.output_names) == 1
+    input_cfg = inputs[0]
     input_shape = input_cfg.shape
     self.input_shape = input_shape
-    if len(input_shape) >= 4 and input_shape[2] is not None and input_shape[3] is not None:
-        self.input_size = tuple(input_shape[2:4][::-1])
-    else:
-        inferred_size = None
-        # Attempt to infer static dimensions from the ONNX graph definition first.
-        for value_info in graph.input:
-            if value_info.name == input_cfg.name and value_info.type.HasField("tensor_type"):
-                tensor_shape = value_info.type.tensor_type.shape
-                dims = []
-                for dim in tensor_shape.dim:
-                    if dim.HasField("dim_value"):
-                        dims.append(dim.dim_value)
-                    elif dim.HasField("dim_param"):
-                        try:
-                            dims.append(int(dim.dim_param))
-                        except (TypeError, ValueError):
-                            dims.append(None)
-                    else:
-                        dims.append(None)
+    self.input_size = tuple(input_shape[2:4][::-1])
 
-                if len(dims) >= 4 and dims[2] and dims[3]:
-                    inferred_size = (dims[3], dims[2])
-                    break
 
-        # Fall back to a sensible default if the model omits spatial dims (e.g., Hyperswap 256).
-        if inferred_size is None:
-            model_name = osp.basename(self.model_file).lower() if self.model_file else ""
-            if "256" in model_name:
-                inferred_size = (256, 256)
-            else:
-                inferred_size = (128, 128)
-            logger.warning(
-                "Model %s does not expose spatial input dims; defaulting INSwapper input size to %sx%s.",
-                model_name or "unknown",
-                inferred_size[0],
-                inferred_size[1],
-            )
+def _extract_embedding_map(graph, latent_dim):
+    for initializer in graph.initializer:
+        arr = numpy_helper.to_array(initializer)
+        if arr.shape == (latent_dim, latent_dim):
+            return arr
+    return np.eye(latent_dim, dtype=np.float32)
 
-        self.input_size = inferred_size
+
+class Hyperswapper():
+    taskname = 'inswapper'
+
+    def __init__(self, model_file=None, session=None):
+        self.model_file = model_file
+        self.session = session
+        model = onnx.load(self.model_file)
+        graph = model.graph
+        inputs = graph.input
+        outputs = graph.output
+        blob_input, latent_input = _find_blob_and_latent_inputs(inputs)
+        self.input_mean = 0.0
+        self.input_std = 255.0
+        self.blob_name = blob_input.name
+        self.latent_name = latent_input.name
+        self.latent_dim = latent_input.type.tensor_type.shape.dim[-1].dim_value
+        self.emap = _extract_embedding_map(graph, self.latent_dim)
+        self.output_names = [out.name for out in outputs]
+        if self.session is None:
+            self.session = onnxruntime.InferenceSession(self.model_file, None)
+        self.input_size = tuple(blob_input.type.tensor_type.shape.dim[2:4][::-1])
+
+    def _normalize_latent(self, embedding):
+        latent = embedding.reshape((1, -1)).astype(np.float32)
+        latent = np.dot(latent, self.emap)
+        norm = np.linalg.norm(latent)
+        if norm != 0:
+            latent /= norm
+        return latent
+
+    def _prepare_inputs(self, img, target_face, source_face):
+        aimg, M = face_align.norm_crop2(img, target_face.kps, self.input_size[0])
+        blob = cv2.dnn.blobFromImage(aimg, 1.0 / self.input_std, self.input_size,
+                                     (self.input_mean, self.input_mean, self.input_mean), swapRB=True)
+        latent = self._normalize_latent(source_face.normed_embedding)
+        feeds = {
+            self.latent_name: latent,
+            self.blob_name: blob
+        }
+        return feeds, aimg, M
+
+    def get(self, img, target_face, source_face, paste_back=True):
+        feeds, aimg, M = self._prepare_inputs(img, target_face, source_face)
+        preds = self.session.run(self.output_names, feeds)
+        outputs = dict(zip(self.output_names, preds))
+        pred = outputs.get('output', preds[0])
+        mask = outputs.get('mask', preds[1] if len(preds) > 1 else None)
+
+        img_fake = pred.transpose((0, 2, 3, 1))[0]
+        bgr_fake = np.clip(255 * img_fake, 0, 255).astype(np.uint8)[:, :, ::-1]
+
+        if not paste_back:
+            return bgr_fake, M
+
+        target_img = img
+        IM = cv2.invertAffineTransform(M)
+        bgr_fake = cv2.warpAffine(bgr_fake, IM, (target_img.shape[1], target_img.shape[0]), borderValue=0.0)
+
+        if mask is not None:
+            mask_img = mask[0, 0]
+            if mask_img.max() > 1.0:
+                mask_img = mask_img / 255.0
+            mask_img = np.clip(mask_img, 0.0, 1.0)
+            mask_img = cv2.warpAffine(mask_img, IM, (target_img.shape[1], target_img.shape[0]), borderValue=0.0)
+            mask_img = cv2.GaussianBlur(mask_img, (11, 11), 0)
+            mask_img = np.expand_dims(mask_img, axis=2)
+        else:
+            mask_img = np.full((target_img.shape[0], target_img.shape[1], 1), 1.0, dtype=np.float32)
+
+        fake_merged = mask_img * bgr_fake.astype(np.float32) + (1 - mask_img) * target_img.astype(np.float32)
+        return fake_merged.astype(np.uint8)
 
 
 def patched_get_default_providers():
@@ -379,14 +412,12 @@ patched_functions = [patched_get_default_providers, patched_get_model, patched_f
 
 
 def apply_logging_patch(console_logging_level):
-    # Always apply the patched insightface hooks so model routing and INSwapper
-    # initialization remain resilient (required for models like hyperswap_256),
-    # while only the logger verbosity changes per level.
-    patch_insightface(*patched_functions)
-
     if console_logging_level == 0:
+        patch_insightface(*patched_functions)
         logger.setLevel(logging.WARNING)
     elif console_logging_level == 1:
+        patch_insightface(*patched_functions)
         logger.setLevel(logging.STATUS)
     elif console_logging_level == 2:
+        patch_insightface(*original_functions)
         logger.setLevel(logging.INFO)
