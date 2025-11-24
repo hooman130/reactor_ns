@@ -245,9 +245,20 @@ def patched_inswapper_init(self, model_file=None, session=None):
             latent_dim = _infer_latent_dim(inputs, graph)
             self.emap = _pick_emap(graph, latent_dim)
     inputs = self.session.get_inputs()
-    self.input_names = []
+
+    # Some models (e.g., hyperswap_256) expose the latent input first and the
+    # target image second, which causes INSwapper.get to feed the tensors in the
+    # wrong order. Reorder the inputs so the 4D image tensor is always first and
+    # embeddings follow.
+    image_input = None
     for inp in inputs:
-        self.input_names.append(inp.name)
+        if len(inp.shape) >= 4:
+            image_input = inp
+            break
+    if image_input is None:
+        image_input = inputs[0]
+    reordered_inputs = [image_input] + [inp for inp in inputs if inp is not image_input]
+    self.input_names = [inp.name for inp in reordered_inputs]
     outputs = self.session.get_outputs()
     output_names = [out.name for out in outputs]
     if not output_names:
@@ -264,7 +275,7 @@ def patched_inswapper_init(self, model_file=None, session=None):
         )
         output_names = [output_names[0]]
     self.output_names = output_names
-    input_cfg = inputs[0]
+    input_cfg = reordered_inputs[0]
     input_shape = input_cfg.shape
     self.input_shape = input_shape
     if len(input_shape) >= 4 and input_shape[2] is not None and input_shape[3] is not None:
