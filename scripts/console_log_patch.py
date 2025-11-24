@@ -133,7 +133,12 @@ def _pick_emap(graph, latent_dim):
     """
 
     best = None
-    if latent_dim is None:
+    if latent_dim is None or latent_dim < 64:
+        if latent_dim is not None and latent_dim < 64:
+            logger.warning(
+                "Ignoring suspicious latent dim %s; probing ONNX graph for a realistic value instead.",
+                latent_dim,
+            )
         latent_dim = _latent_dim_from_initializers(graph) or 512
 
     allowed_dims = {64, 80, 96, 128, 160, 192, 256, 320, 512, latent_dim}
@@ -180,6 +185,13 @@ def _pick_emap(graph, latent_dim):
     if best.ndim == 1:
         best = np.diag(best.astype(np.float32))
 
+    if latent_dim is not None and best.shape[0] != latent_dim and best.shape[1] != latent_dim:
+        logger.warning(
+            "No embedding map aligned with latent dim %s; using identity matrix to match arcface embeddings.",
+            latent_dim,
+        )
+        best = np.eye(latent_dim, dtype=np.float32)
+
     return np.asarray(best, dtype=np.float32)
 
 
@@ -205,6 +217,14 @@ def _infer_latent_dim(inputs, graph):
                     dims.append(None)
             if len(dims) > 1 and dims[1] is not None:
                 latent_dim = dims[1]
+
+    if latent_dim is not None and latent_dim < 64:
+        logger.warning(
+            "Latent dim %s reported by ONNX metadata is too small for embeddings; falling back to graph inspection.",
+            latent_dim,
+        )
+        return None
+
     return latent_dim
 
 
