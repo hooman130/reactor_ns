@@ -101,6 +101,193 @@ def patched_faceanalysis_prepare(self, ctx_id, det_thresh=0.5, det_size=(640, 64
             model.prepare(ctx_id)
 
 
+def _latent_dim_from_initializers(graph):
+    """Try to infer the latent embedding size from ONNX initializers.
+
+    The goal is to combine the largest plausible projection matrix with
+    any explicit latent-sized tensor we see, while skipping tiny kernels
+    that previously caused conflicts when merging with upstream changes.
+    """
+
+    preferred = [512, 320, 256, 192, 160, 128, 96, 80, 64]
+    best = None
+
+    # Track all candidate dimensions we see to reconcile conflicting edits.
+    seen_dims = set()
+
+    for initializer in graph.initializer:
+        dims = tuple(initializer.dims)
+        if len(dims) != 2:
+            continue
+        if dims[0] == dims[1]:
+            seen_dims.add(dims[0])
+        seen_dims.update(dims)
+
+    for candidate in preferred:
+        if candidate in seen_dims:
+            best = candidate
+            break
+
+    if best is None and seen_dims:
+        # Fall back to the largest square-ish matrix we saw to remain
+        # compatible with upstream logic while still preferring projection
+        # shapes over small conv kernels.
+        fallback_dims = [d for d in seen_dims if d is not None and d >= 64]
+        if fallback_dims:
+            best = max(fallback_dims)
+
+    return best
+
+
+def _reshape_emap(best, latent_dim):
+    """Force the embedding map to emit vectors with the expected latent size.
+
+    Some hyperswap variants store projection matrices that expand embeddings
+    (e.g., 512x1024). That leads to ONNX Runtime complaining that the "source"
+    input has the wrong dimension. We truncate or pad to a square latent_dim
+    projection so INSwapper.get always returns the shape the model expects.
+    """
+
+    if latent_dim is None or best.ndim != 2:
+        return np.asarray(best, dtype=np.float32)
+
+    rows, cols = best.shape
+    if rows != latent_dim or cols != latent_dim:
+        logger.warning(
+            "Reshaping embedding map from %sx%s to %sx%s to align with latent dim.",
+            rows,
+            cols,
+            latent_dim,
+            latent_dim,
+        )
+
+    # Align columns first so any subsequent row padding has the correct width.
+    if cols < latent_dim:
+        pad_cols = latent_dim - cols
+        best = np.hstack([best, np.eye(rows, dtype=np.float32)[:, :pad_cols]])
+    elif cols > latent_dim:
+        best = best[:, :latent_dim]
+
+    # Adjust rows to guarantee the dot product input matches latent_dim.
+    if best.shape[0] < latent_dim:
+        pad_rows = latent_dim - best.shape[0]
+        best = np.vstack([
+            best,
+            np.eye(latent_dim, dtype=np.float32)[:pad_rows, :latent_dim],
+        ])
+    elif best.shape[0] > latent_dim:
+        best = best[:latent_dim, :]
+
+    return np.asarray(best, dtype=np.float32)
+
+
+def _pick_emap(graph, latent_dim):
+    """
+    Hyperswap models may not store the embedding map as the last initializer
+    or may expose a 1D bias vector there, which breaks the stock dot product
+    against arcface embeddings. Choose a matrix whose shape aligns with the
+    latent size (guessing common dimensions when metadata is missing),
+    transposing if needed, and fall back to an identity map so inference can
+    proceed even when the ONNX layout differs.
+    """
+
+    best = None
+    if latent_dim is None or latent_dim < 64:
+        if latent_dim is not None and latent_dim < 64:
+            logger.warning(
+                "Ignoring suspicious latent dim %s; probing ONNX graph for a realistic value instead.",
+                latent_dim,
+            )
+        latent_dim = _latent_dim_from_initializers(graph) or 512
+
+    allowed_dims = {64, 80, 96, 128, 160, 192, 256, 320, 512, latent_dim}
+    min_dim = 64 if latent_dim is None else min(latent_dim, 64)
+
+    for initializer in graph.initializer:
+        arr = numpy_helper.to_array(initializer)
+        if arr.ndim != 2:
+            continue
+
+        if min(arr.shape) < min_dim:
+            continue
+
+        if arr.shape[0] not in allowed_dims and arr.shape[1] not in allowed_dims:
+            continue
+
+        # Prefer matrices that already emit the latent size so we don't upsample
+        # embeddings for models that expect 512-dim inputs.
+        if arr.shape == (latent_dim, latent_dim):
+            best = arr
+            break
+        if arr.shape[1] == latent_dim:
+            best = arr
+            break
+        if arr.shape[0] == latent_dim:
+            best = arr
+            break
+
+        # If neither axis matches exactly, prefer the larger square-ish option
+        # to stay compatible with upstream heuristics while avoiding tiny kernels.
+        if best is None and arr.shape[0] == arr.shape[1] and arr.shape[0] in allowed_dims:
+            best = arr
+
+    if best is None and latent_dim is not None:
+        logger.warning(
+            "No embedding map matched latent dim %s; using identity matrix so inference can continue.",
+            latent_dim,
+        )
+        best = np.eye(latent_dim, dtype=np.float32)
+
+    if best is None:
+        logger.warning(
+            "No embedding map found in ONNX graph; defaulting to %sx%s identity passthrough.",
+            latent_dim,
+            latent_dim,
+        )
+        best = np.eye(latent_dim, dtype=np.float32)
+
+    if best.ndim == 1:
+        best = np.diag(best.astype(np.float32))
+
+    if latent_dim is not None:
+        best = _reshape_emap(best, latent_dim)
+
+    return np.asarray(best, dtype=np.float32)
+
+
+def _infer_latent_dim(inputs, graph):
+    latent_dim = None
+    if len(inputs) > 1:
+        latent_shape = inputs[1].shape
+        if len(latent_shape) > 1 and latent_shape[1] is not None:
+            latent_dim = latent_shape[1]
+    if latent_dim is None and len(graph.input) > 1:
+        latent_vi = graph.input[1]
+        if latent_vi.type.HasField("tensor_type"):
+            dims = []
+            for dim in latent_vi.type.tensor_type.shape.dim:
+                if dim.HasField("dim_value"):
+                    dims.append(dim.dim_value)
+                elif dim.HasField("dim_param"):
+                    try:
+                        dims.append(int(dim.dim_param))
+                    except (TypeError, ValueError):
+                        dims.append(None)
+                else:
+                    dims.append(None)
+            if len(dims) > 1 and dims[1] is not None:
+                latent_dim = dims[1]
+
+    if latent_dim is not None and latent_dim < 64:
+        logger.warning(
+            "Latent dim %s reported by ONNX metadata is too small for embeddings; falling back to graph inspection.",
+            latent_dim,
+        )
+        return None
+
+    return latent_dim
+
+
 def patched_inswapper_init(self, model_file=None, session=None):
     self.model_file = model_file
     self.session = session
