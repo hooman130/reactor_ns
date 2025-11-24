@@ -2,6 +2,8 @@ import os.path as osp
 import glob
 import logging
 import insightface
+import cv2
+import numpy as np
 from insightface.model_zoo.model_zoo import ModelRouter, PickableInferenceSession, get_default_providers
 from insightface.model_zoo.retinaface import RetinaFace
 from insightface.model_zoo.landmark import Landmark
@@ -9,12 +11,31 @@ from insightface.model_zoo.attribute import Attribute
 from insightface.model_zoo.inswapper import INSwapper
 from insightface.model_zoo.arcface_onnx import ArcFaceONNX
 from insightface.app import FaceAnalysis
-from insightface.utils import DEFAULT_MP_NAME, ensure_available
+from insightface.utils import DEFAULT_MP_NAME, ensure_available, face_align
 from insightface.model_zoo import model_zoo
 import onnxruntime
 import onnx
 from onnx import numpy_helper
 from scripts.reactor_logger import logger
+
+
+def _get_input_shape_dims(input_info):
+    try:
+        return len(input_info.shape)
+    except Exception:
+        return 0
+
+
+def _find_blob_and_latent_inputs(inputs):
+    blob_input = None
+    latent_input = None
+    for inp in inputs:
+        dims = _get_input_shape_dims(inp)
+        if dims == 4:
+            blob_input = inp
+        elif dims == 2:
+            latent_input = inp
+    return blob_input, latent_input
 
 
 def patched_get_model(self, **kwargs):
@@ -26,16 +47,25 @@ def patched_get_model(self, **kwargs):
 
     if len(outputs) >= 5:
         return RetinaFace(model_file=self.onnx_file, session=session)
-    elif input_shape[2] == 192 and input_shape[3] == 192:
+
+    dims = _get_input_shape_dims(input_cfg)
+    if dims >= 4 and input_shape[2] == 192 and input_shape[3] == 192:
         return Landmark(model_file=self.onnx_file, session=session)
-    elif input_shape[2] == 96 and input_shape[3] == 96:
+    elif dims >= 4 and input_shape[2] == 96 and input_shape[3] == 96:
         return Attribute(model_file=self.onnx_file, session=session)
-    elif len(inputs) == 2 and input_shape[2] == 128 and input_shape[3] == 128:
-        return INSwapper(model_file=self.onnx_file, session=session)
-    elif input_shape[2] == input_shape[3] and input_shape[2] >= 112 and input_shape[2] % 16 == 0:
+
+    if len(inputs) == 2:
+        blob_input, latent_input = _find_blob_and_latent_inputs(inputs)
+        if blob_input is not None and latent_input is not None:
+            blob_shape = blob_input.shape
+            if blob_shape[2] == 128 and blob_shape[3] == 128:
+                return INSwapper(model_file=self.onnx_file, session=session)
+            if blob_shape[2] == blob_shape[3] and blob_shape[2] >= 192:
+                return Hyperswapper(model_file=self.onnx_file, session=session)
+
+    if dims >= 4 and input_shape[2] == input_shape[3] and input_shape[2] >= 112 and input_shape[2] % 16 == 0:
         return ArcFaceONNX(model_file=self.onnx_file, session=session)
-    else:
-        return None
+    return None
 
 
 def patched_faceanalysis_init(self, name=DEFAULT_MP_NAME, root='~/.insightface', allowed_modules=None, **kwargs):
@@ -95,6 +125,87 @@ def patched_inswapper_init(self, model_file=None, session=None):
     input_shape = input_cfg.shape
     self.input_shape = input_shape
     self.input_size = tuple(input_shape[2:4][::-1])
+
+
+def _extract_embedding_map(graph, latent_dim):
+    for initializer in graph.initializer:
+        arr = numpy_helper.to_array(initializer)
+        if arr.shape == (latent_dim, latent_dim):
+            return arr
+    return np.eye(latent_dim, dtype=np.float32)
+
+
+class Hyperswapper():
+    taskname = 'inswapper'
+
+    def __init__(self, model_file=None, session=None):
+        self.model_file = model_file
+        self.session = session
+        model = onnx.load(self.model_file)
+        graph = model.graph
+        inputs = graph.input
+        outputs = graph.output
+        blob_input, latent_input = _find_blob_and_latent_inputs(inputs)
+        self.input_mean = 0.0
+        self.input_std = 255.0
+        self.blob_name = blob_input.name
+        self.latent_name = latent_input.name
+        self.latent_dim = latent_input.type.tensor_type.shape.dim[-1].dim_value
+        self.emap = _extract_embedding_map(graph, self.latent_dim)
+        self.output_names = [out.name for out in outputs]
+        if self.session is None:
+            self.session = onnxruntime.InferenceSession(self.model_file, None)
+        self.input_size = tuple(blob_input.type.tensor_type.shape.dim[2:4][::-1])
+
+    def _normalize_latent(self, embedding):
+        latent = embedding.reshape((1, -1)).astype(np.float32)
+        latent = np.dot(latent, self.emap)
+        norm = np.linalg.norm(latent)
+        if norm != 0:
+            latent /= norm
+        return latent
+
+    def _prepare_inputs(self, img, target_face, source_face):
+        aimg, M = face_align.norm_crop2(img, target_face.kps, self.input_size[0])
+        blob = cv2.dnn.blobFromImage(aimg, 1.0 / self.input_std, self.input_size,
+                                     (self.input_mean, self.input_mean, self.input_mean), swapRB=True)
+        latent = self._normalize_latent(source_face.normed_embedding)
+        feeds = {
+            self.latent_name: latent,
+            self.blob_name: blob
+        }
+        return feeds, aimg, M
+
+    def get(self, img, target_face, source_face, paste_back=True):
+        feeds, aimg, M = self._prepare_inputs(img, target_face, source_face)
+        preds = self.session.run(self.output_names, feeds)
+        outputs = dict(zip(self.output_names, preds))
+        pred = outputs.get('output', preds[0])
+        mask = outputs.get('mask', preds[1] if len(preds) > 1 else None)
+
+        img_fake = pred.transpose((0, 2, 3, 1))[0]
+        bgr_fake = np.clip(255 * img_fake, 0, 255).astype(np.uint8)[:, :, ::-1]
+
+        if not paste_back:
+            return bgr_fake, M
+
+        target_img = img
+        IM = cv2.invertAffineTransform(M)
+        bgr_fake = cv2.warpAffine(bgr_fake, IM, (target_img.shape[1], target_img.shape[0]), borderValue=0.0)
+
+        if mask is not None:
+            mask_img = mask[0, 0]
+            if mask_img.max() > 1.0:
+                mask_img = mask_img / 255.0
+            mask_img = np.clip(mask_img, 0.0, 1.0)
+            mask_img = cv2.warpAffine(mask_img, IM, (target_img.shape[1], target_img.shape[0]), borderValue=0.0)
+            mask_img = cv2.GaussianBlur(mask_img, (11, 11), 0)
+            mask_img = np.expand_dims(mask_img, axis=2)
+        else:
+            mask_img = np.full((target_img.shape[0], target_img.shape[1], 1), 1.0, dtype=np.float32)
+
+        fake_merged = mask_img * bgr_fake.astype(np.float32) + (1 - mask_img) * target_img.astype(np.float32)
+        return fake_merged.astype(np.uint8)
 
 
 def patched_get_default_providers():
