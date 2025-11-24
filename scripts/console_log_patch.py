@@ -122,6 +122,48 @@ def _latent_dim_from_initializers(graph):
     return best
 
 
+def _reshape_emap(best, latent_dim):
+    """Force the embedding map to emit vectors with the expected latent size.
+
+    Some hyperswap variants store projection matrices that expand embeddings
+    (e.g., 512x1024). That leads to ONNX Runtime complaining that the "source"
+    input has the wrong dimension. We truncate or pad to a square latent_dim
+    projection so INSwapper.get always returns the shape the model expects.
+    """
+
+    if latent_dim is None or best.ndim != 2:
+        return np.asarray(best, dtype=np.float32)
+
+    rows, cols = best.shape
+    if rows != latent_dim or cols != latent_dim:
+        logger.warning(
+            "Reshaping embedding map from %sx%s to %sx%s to align with latent dim.",
+            rows,
+            cols,
+            latent_dim,
+            latent_dim,
+        )
+
+    # Align columns first so any subsequent row padding has the correct width.
+    if cols < latent_dim:
+        pad_cols = latent_dim - cols
+        best = np.hstack([best, np.eye(rows, dtype=np.float32)[:, :pad_cols]])
+    elif cols > latent_dim:
+        best = best[:, :latent_dim]
+
+    # Adjust rows to guarantee the dot product input matches latent_dim.
+    if best.shape[0] < latent_dim:
+        pad_rows = latent_dim - best.shape[0]
+        best = np.vstack([
+            best,
+            np.eye(latent_dim, dtype=np.float32)[:pad_rows, :latent_dim],
+        ])
+    elif best.shape[0] > latent_dim:
+        best = best[:latent_dim, :]
+
+    return np.asarray(best, dtype=np.float32)
+
+
 def _pick_emap(graph, latent_dim):
     """
     Hyperswap models may not store the embedding map as the last initializer
@@ -155,11 +197,16 @@ def _pick_emap(graph, latent_dim):
         if arr.shape[0] not in allowed_dims and arr.shape[1] not in allowed_dims:
             continue
 
-        if arr.shape[0] == latent_dim:
+        # Prefer matrices that already emit the latent size so we don't upsample
+        # embeddings for models that expect 512-dim inputs.
+        if arr.shape == (latent_dim, latent_dim):
             best = arr
             break
         if arr.shape[1] == latent_dim:
-            best = arr.T
+            best = arr
+            break
+        if arr.shape[0] == latent_dim:
+            best = arr
             break
 
         # If neither axis matches exactly, prefer the larger square-ish option
@@ -185,12 +232,8 @@ def _pick_emap(graph, latent_dim):
     if best.ndim == 1:
         best = np.diag(best.astype(np.float32))
 
-    if latent_dim is not None and best.shape[0] != latent_dim and best.shape[1] != latent_dim:
-        logger.warning(
-            "No embedding map aligned with latent dim %s; using identity matrix to match arcface embeddings.",
-            latent_dim,
-        )
-        best = np.eye(latent_dim, dtype=np.float32)
+    if latent_dim is not None:
+        best = _reshape_emap(best, latent_dim)
 
     return np.asarray(best, dtype=np.float32)
 
