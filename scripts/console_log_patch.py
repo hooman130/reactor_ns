@@ -85,18 +85,41 @@ def patched_faceanalysis_prepare(self, ctx_id, det_thresh=0.5, det_size=(640, 64
 
 
 def _latent_dim_from_initializers(graph):
-    # Prefer the largest plausible latent dimension we see to avoid locking onto
-    # incidental small matrices (e.g., early FC/conv weights) that appeared in
-    # earlier heuristics and produced tiny projections.
-    allowed = [512, 256, 128, 64]
-    for candidate in allowed:
-        for initializer in graph.initializer:
-            dims = tuple(initializer.dims)
-            if len(dims) != 2:
-                continue
-            if dims[0] == dims[1] == candidate or dims[1] == candidate:
-                return candidate
-    return None
+    """Try to infer the latent embedding size from ONNX initializers.
+
+    The goal is to combine the largest plausible projection matrix with
+    any explicit latent-sized tensor we see, while skipping tiny kernels
+    that previously caused conflicts when merging with upstream changes.
+    """
+
+    preferred = [512, 320, 256, 192, 160, 128, 96, 80, 64]
+    best = None
+
+    # Track all candidate dimensions we see to reconcile conflicting edits.
+    seen_dims = set()
+
+    for initializer in graph.initializer:
+        dims = tuple(initializer.dims)
+        if len(dims) != 2:
+            continue
+        if dims[0] == dims[1]:
+            seen_dims.add(dims[0])
+        seen_dims.update(dims)
+
+    for candidate in preferred:
+        if candidate in seen_dims:
+            best = candidate
+            break
+
+    if best is None and seen_dims:
+        # Fall back to the largest square-ish matrix we saw to remain
+        # compatible with upstream logic while still preferring projection
+        # shapes over small conv kernels.
+        fallback_dims = [d for d in seen_dims if d is not None and d >= 64]
+        if fallback_dims:
+            best = max(fallback_dims)
+
+    return best
 
 
 def _pick_emap(graph, latent_dim):
@@ -113,8 +136,9 @@ def _pick_emap(graph, latent_dim):
     if latent_dim is None:
         latent_dim = _latent_dim_from_initializers(graph) or 512
 
-    allowed_dims = {64, 128, 256, 512, latent_dim}
+    allowed_dims = {64, 80, 96, 128, 160, 192, 256, 320, 512, latent_dim}
     min_dim = 64 if latent_dim is None else min(latent_dim, 64)
+
     for initializer in graph.initializer:
         arr = numpy_helper.to_array(initializer)
         if arr.ndim != 2:
@@ -123,9 +147,6 @@ def _pick_emap(graph, latent_dim):
         if min(arr.shape) < min_dim:
             continue
 
-        # Skip tiny matrices (e.g., convolution kernels like 3x3) that cannot be
-        # valid embedding maps and would trigger the shape mismatch seen with
-        # hyperswap_256 (512 x 3).
         if arr.shape[0] not in allowed_dims and arr.shape[1] not in allowed_dims:
             continue
 
@@ -135,6 +156,11 @@ def _pick_emap(graph, latent_dim):
         if arr.shape[1] == latent_dim:
             best = arr.T
             break
+
+        # If neither axis matches exactly, prefer the larger square-ish option
+        # to stay compatible with upstream heuristics while avoiding tiny kernels.
+        if best is None and arr.shape[0] == arr.shape[1] and arr.shape[0] in allowed_dims:
+            best = arr
 
     if best is None and latent_dim is not None:
         logger.warning(
